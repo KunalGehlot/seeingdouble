@@ -1,5 +1,6 @@
 let settings = {};
 let wordBank = [];
+let hasOpenAiApiKey = false;
 let primaryPicker, secondaryPicker;
 
 if (BROWSER === 'firefox') {
@@ -31,7 +32,8 @@ port.onMessage.addListener((msg) => {
   primaryPicker?.setColor(settings.primaryTextColor || "#ffffff", true);
   secondaryPicker?.setColor(settings.secondaryTextColor || "#ffffff", true);
 
-  if ('hasOpenAiApiKey' in msg) renderOpenAiKeyStatus(msg.hasOpenAiApiKey);
+  if ('hasOpenAiApiKey' in msg) hasOpenAiApiKey = msg.hasOpenAiApiKey;
+  renderOpenAiKeyStatus(hasOpenAiApiKey);
 });
 
 // -----------------------------------------------------------------------------
@@ -233,6 +235,7 @@ window.addEventListener('load', evt => {
   renderVersion();
   renderActiveSettings();
   renderWordBank();
+  renderOpenAiKeyStatus(hasOpenAiApiKey);
 
   // handle click events
   // ---------------------------------------------------------------------------

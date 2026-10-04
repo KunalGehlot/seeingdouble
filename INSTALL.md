@@ -33,5 +33,25 @@ installation -- the extension is removed on browser restart.
 
 Safari
 ----
-See the Safari build notes in the repository (requires Xcode and
-`xcrun safari-web-extension-converter`).
+Requires Xcode and a free or paid Apple Developer account.
+
+1) Convert the Chrome build into a Safari app project (run once; `--macos-only --swift` skips
+   iOS, `--project-location` is where the generated Xcode project goes):
+   ```
+   xcrun safari-web-extension-converter build/chrome --macos-only --swift \
+     --project-location build/safari --app-name SeeingDouble \
+     --bundle-identifier com.yourname.SeeingDouble
+   ```
+2) After each `npm run build`, rebuild the Safari app (replace `YOUR_TEAM_ID` with your Apple
+   Developer Team ID, found at https://developer.apple.com/account under Membership):
+   ```
+   xcodebuild -project build/safari/SeeingDouble/SeeingDouble.xcodeproj -scheme SeeingDouble \
+     -derivedDataPath ~/Library/Developer/Xcode/DerivedData/SeeingDouble-safari \
+     DEVELOPMENT_TEAM=YOUR_TEAM_ID -allowProvisioningUpdates build
+   ```
+3) Toggle the extension off/on in Safari's Settings > Extensions to pick up the rebuild.
+
+**If your project directory is inside iCloud Drive** (e.g. under `~/Documents` with iCloud sync
+on), point `-derivedDataPath` somewhere outside it, as above. iCloud-synced files pick up
+extended attributes that make codesigning fail with "resource fork, Finder information, or
+similar detritus not allowed".

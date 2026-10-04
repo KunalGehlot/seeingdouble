@@ -118,10 +118,59 @@ async function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
   assert.ok(!JSON.stringify(simplifyReply).includes('sk-real-key-12345'), 'reply to agent must never contain the raw key');
   console.log('PASS: simplify request reaches OpenAI with key, reply to agent has no key, correct requestId');
 
+  // 7a. Agent-supplied `level` is ignored -- the user's own stored setting (300) is used, not
+  // whatever the page sends (100)
+  fetchCalls = [];
+  agentPort.send({ simplify: { requestId: 8, text: 'Another cue', level: '100' } });
+  await wait(50);
+  assert.strictEqual(fetchCalls.length, 1, 'should have made exactly one fetch call');
+  const requestBody = JSON.parse(fetchCalls[0].opts.body);
+  assert.ok(requestBody.messages[0].content.includes('300 words'), 'must use the stored vocabulary level, not the one the page sent');
+  console.log('PASS: agent-supplied vocabulary level is ignored in favor of the stored setting');
+
+  // 7b. Oversized text (well beyond a subtitle cue) is rejected without ever calling fetch
+  fetchCalls = [];
+  agentPort.send({ simplify: { requestId: 9, text: 'x'.repeat(501), level: '300' } });
+  await wait(50);
+  assert.strictEqual(fetchCalls.length, 0, 'must not call OpenAI for text over the length cap');
+  console.log('PASS: oversized text is rejected before reaching OpenAI');
+
+  // 7c. A 401 (bad key) short-circuits further requests, and the agent never sees the key or the
+  // detailed OpenAI error (which can echo part of a rejected key)
+  const originalFetch = global.fetch;
+  global.fetch = async () => ({
+    ok: false,
+    status: 401,
+    text: async () => 'Incorrect API key provided: sk-real-key...2345',
+  });
+  agentPort.send({ simplify: { requestId: 10, text: 'Cue after bad key', level: '300' } });
+  await wait(50);
+  const badKeyReply = agentPort.received.filter(m => m.simplifyResult).pop();
+  assert.strictEqual(badKeyReply.simplifyResult.requestId, 10);
+  assert.ok(!JSON.stringify(badKeyReply).includes('sk-real-key'), 'error reply must not echo the key');
+  assert.ok(!JSON.stringify(badKeyReply).toLowerCase().includes('incorrect api key'), 'error reply must not leak OpenAI\'s detailed error');
+  console.log('PASS: 401 response reply to agent has no key or detailed error');
+
+  let fetchCallsAfter401 = 0;
+  global.fetch = async () => { fetchCallsAfter401++; return originalFetch ? originalFetch() : {}; };
+  agentPort.send({ simplify: { requestId: 11, text: 'Cue while key still bad', level: '300' } });
+  await wait(50);
+  assert.strictEqual(fetchCallsAfter401, 0, 'must not retry OpenAI while the key is still marked invalid');
+  console.log('PASS: no further requests after a 401, until the key changes');
+
+  global.fetch = originalFetch;
+  popupPort.send({ openaiApiKey: 'sk-new-key-67890' });
+  await wait(10);
+  fetchCalls = [];
+  agentPort.send({ simplify: { requestId: 12, text: 'Cue after new key', level: '300' } });
+  await wait(50);
+  assert.strictEqual(fetchCalls.length, 1, 'a freshly-entered key should get a new attempt');
+  console.log('PASS: entering a new key allows requests again');
+
   // 8. Reset: key must survive (reset only clears gSettings, not the key)
   popupPort.send({ resetSettings: true });
   await wait(10);
-  assert.strictEqual(storage.openaiApiKey, 'sk-real-key-12345', 'Reset to Default must not wipe the API key');
+  assert.strictEqual(storage.openaiApiKey, 'sk-new-key-67890', 'Reset to Default must not wipe the API key');
   const afterReset = popupPort.received.filter(m => m.settings).pop();
   assert.strictEqual(afterReset.settings.simplifySubtitlesWithAI, false, 'reset should restore the default (off)');
   console.log('PASS: Reset to Default clears settings but preserves the API key');
