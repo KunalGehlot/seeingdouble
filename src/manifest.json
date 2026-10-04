@@ -1,8 +1,7 @@
 {
-  "name": "NflxMultiSubs",
+  "name": "SeeingDouble",
   "manifest_version": 2,
-  "version": "1.0.0",
-  "author": "Dan Chen, Gert Mertes",
+  "author": "Dan Chen, Gert Mertes, Kunal Gehlot",
 
   "permissions": [
     "storage",

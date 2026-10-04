@@ -1,7 +1,7 @@
 {
-  "name": "NflxMultiSubs",
-  "description": "Bilingual Subtitles for Netflix (fixed)",
-  "author": "Dan Chen, Gert Mertes",
+  "name": "SeeingDouble",
+  "description": "Bilingual Subtitles for Netflix, with optional AI-simplified vocabulary levels",
+  "author": "Dan Chen, Gert Mertes, Kunal Gehlot",
   "version": "2.3.5",
   "license": "MIT",
   "private": true,
