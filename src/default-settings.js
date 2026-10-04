@@ -12,8 +12,8 @@ const kDefaultSettings = {
   secondaryTextStroke: 2.0,
   secondaryTextOpacity: 1,
   secondaryTextColor: "#ffffff",
-  secondaryLanguageMode: 'audio', // disabled, audio, last (last used language)
-  secondaryLanguageLastUsed: undefined, // bcp47 code of the last used language 
+  secondaryLanguageMode: 'last', // disabled, audio, last (last used language; matches the audio language until one is picked)
+  secondaryLanguageLastUsed: undefined, // bcp47 code of the last used language; null if the user picked "Off"
   secondaryLanguageLastUsedIsCaption: undefined,
 };
 

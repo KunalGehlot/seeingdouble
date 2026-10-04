@@ -37,10 +37,6 @@
     }
   ],
 
-  "externally_connectable": {
-    "matches": ["https://www.netflix.com/*"]
-  },
-
   "web_accessible_resources": [
     "nflxmultisubs.min.js"
   ]

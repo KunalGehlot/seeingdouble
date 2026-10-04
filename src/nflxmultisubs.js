@@ -4,18 +4,6 @@ const kDefaultSettings = require('./default-settings');
 const PlaybackRateController = require('./playback-rate-controller');
 const { OpenAI } = require('openai');
 
-
-
-let firstWord = "";
-let secondWord = "";
-let thirdWord = "";
-let fourthWord = "";
-let fifthWord = "";
-let sixthWord = "";
-let seventhWord = "";
-let eighthWord = "";
-let ninethWord = "";
-
 ////////////////////////////////////////////////////////////////////////////////
 
 // Hook JSON.parse() and attempt to intercept the manifest
@@ -70,60 +58,46 @@ hookJsonParseAndAddCallback(window);
 // global states
 let gSubtitles = [],
   gSubtitleMenu;
-let gMsgPort, gRendererLoop;
+let gRendererLoop;
 let gVideoRatio = 1080 / 1920;
 let gRenderOptions = Object.assign({}, kDefaultSettings);
-let gWordBank = [];
 let gSecondaryOffset = 0; // used to move secondary subs if primary subs overflow the screen edge
+let gSubtitleWords = []; // words of the secondary subtitle on screen, for the 1-9 keyboard shortcuts
 
-(() => {
-  // connect with background script immediately so we can capture settings before playback (used for language mode)
-  if (BROWSER === 'chrome') {
-    if (gMsgPort) return;
-    try {
-      const extensionId = window.__nflxMultiSubsExtId;
-      gMsgPort = chrome.runtime.connect(extensionId);
-      console.log(`Linked: ${extensionId}`);
+// This injected agent cannot use the extension APIs, so messages to/from the background
+// script are relayed by our content script through window.postMessage() (see content.js).
+const kMsgNamespace = 'nflxmultisubs';
+const sendToBackground = msg => {
+  window.postMessage({ namespace: kMsgNamespace, direction: 'to-background', msg }, '*');
+};
 
-      gMsgPort.onMessage.addListener(msg => {
-        if (!msg.settings) return;
-        gRenderOptions = Object.assign({}, msg.settings);
-        gRendererLoop && gRendererLoop.setRenderDirty();
-      });
-    } catch (err) {
-      console.warn('Error: cannot talk to background,', err);
-    }
-    return;
+// Resolves once the background has sent the stored settings, so the secondary language is chosen
+// with the user's settings. Times out in case the background can't be reached.
+let gSettingsReceived = false;
+let resolveSettingsReady;
+const gSettingsReady = new Promise(resolve => {
+  resolveSettingsReady = resolve;
+  setTimeout(() => {
+    resolve();
+    if (!gSettingsReceived) console.warn('Error: no settings from background, using defaults');
+  }, 1500);
+});
+
+window.addEventListener('message', evt => {
+  if (evt.origin !== window.location.origin || !evt.data || evt.data.namespace !== kMsgNamespace) return;
+  if (evt.data.direction !== 'to-agent' || !evt.data.msg) return;
+
+  const msg = evt.data.msg;
+  if (msg.settings) {
+    gRenderOptions = Object.assign({}, kDefaultSettings, msg.settings);
+    gSettingsReceived = true;
+    resolveSettingsReady();
+    gRendererLoop && gRendererLoop.setRenderDirty();
   }
+}, false);
 
-  // Firefox: this injected agent cannot talk to extension directly, thus the
-  // connection (for applying settings) is relayed by our content script through
-  // window.postMessage().
-
-  if (BROWSER === 'firefox') {
-    window.addEventListener(
-        'message',
-        evt => {
-          if (!evt.data || evt.data.namespace !== 'nflxmultisubs') return;
-
-          if (evt.data.action === 'apply-settings' && evt.data.settings) {
-            gRenderOptions = Object.assign({}, evt.data.settings);
-            gRendererLoop && gRendererLoop.setRenderDirty();
-          }
-        },
-        false
-    );
-
-    try {
-      window.postMessage({
-        namespace: 'nflxmultisubs',
-        action: 'connect'
-      }, '*');
-    } catch (err) {
-      console.warn('Error: cannot talk to background,', err);
-    }
-  }
-})();
+// connect immediately so we get the settings before playback starts (used for language mode)
+window.postMessage({ namespace: kMsgNamespace, direction: 'to-background' }, '*');
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -243,41 +217,40 @@ class DehydratedSubtitle extends SubtitleBase {
 
 const DICTIONARY_API_BASE_URL = 'https://api.dictionaryapi.dev/api/v2/entries/en/';
 
-fetchWordDefinition = word => {
-  // Make a request to the API
-  fetch(DICTIONARY_API_BASE_URL + word)
+// Look up a word from the subtitles (clicked, or picked with the 1-9 keys) and add it to the word bank
+const lookUpWord = rawWord => {
+  // strip punctuation but keep letters of any script (e.g. "für", "déjà")
+  const trimmedWord = rawWord.replace(/[^\p{L}\p{N}'-]/gu, '').replace(/^['-]+|['-]+$/g, '');
+  if (!trimmedWord) return;
+  const word = trimmedWord.charAt(0).toUpperCase() + trimmedWord.slice(1);
+  console.log('Looking up word:', word);
+
+  fetch(DICTIONARY_API_BASE_URL + encodeURIComponent(word))
       .then(response => {
-          // Check if the request was successful
           if (!response.ok) {
-              throw new Error('Network response was not ok');
+              throw new Error(`No definition found for "${word}"`);
           }
-          // Parse the JSON response
           return response.json();
       })
       .then(data => {
-          // Extract the definition from the response
           const definition = data[0]?.meanings.flatMap(m => m.definitions).flatMap(d => d.definition)[0];
-          if (definition) {
-              console.log('Definition:', definition);
-              // Create an object with the word and its definition
-              const wordDefinition = { word: word, definition: definition };
-              // Append the word-definition object to the wordBank
-              gWordBank.push(wordDefinition);
-          } else {
-              console.log('No definition found');
+          if (!definition) {
+              console.log(`No definition found for "${word}"`);
+              return;
           }
-          // Send the updated wordBank to background.js
-          if (gMsgPort) {
-              gMsgPort.postMessage({ wordBank: gWordBank });
-          }
+          // the background script keeps the word bank (and ignores duplicates)
+          sendToBackground({ addWord: { word, definition } });
       })
       .catch(error => {
-          console.error('Error fetching definition:', error);
+          console.warn('Error fetching definition:', error.message);
       });
 };
 
 
 
+// Set to true to simplify secondary subtitles with OpenAI (needs an API key in callOpenAIForTranslation).
+// When false, secondary subtitles show Netflix's original text.
+const kSimplifySubtitlesWithOpenAI = false;
 
 // Function to translate text based on selected vocabulary size
 async function translateText(selectedVocabularySize, textContent) {
@@ -338,84 +311,6 @@ async function callOpenAIForTranslation(prompt) {
   }
 }
 
-function createSpanElements(words, options) {
-  const container = document.createElement('div');
-  container.style.textAlign = 'center'; // Set text alignment to center
-  container.style.position = 'absolute';
-  container.style.left = '50%';
-  container.style.transform = 'translateX(-50%)'; // Center horizontally
-
-  const spanContainer = document.createElement('div');
-
-
-  // Wrap each word in a span element and assign a unique class
-  let num = 1;
-  for (const word of words) {
-      console.log("Word: ", word);
-      const span = document.createElement('span');
-      span.textContent = word + ' '; // Add space after each word
-      span.classList.add('word-' + num); // Assign a unique class
-
-      // Apply styling to match the text element
-      span.style.fontSize = '22px';
-      span.style.fontFamily = 'Arial, Helvetica';
-      span.style.color = options.secondaryTextColor;
-      span.style.stroke = 'black';
-      span.style.opacity = options.secondary;
-      span.style.whiteSpace = 'pre-wrap'; // Preserve line breaks
-
-      const clickedWord = span.textContent.trim();
-      switch(num)
-      {   
-        case 1:
-          firstWord = clickedWord;
-          break;
-        case 2:
-          secondWord = clickedWord
-        break;
-        case 3:
-          thirdWord = clickedWord;
-        break;
-        case 4:
-          fourthWord = clickedWord;
-          break;
-        case 5:
-          fifthWord = clickedWord;
-          break;
-        case 6:
-          sixthWord = clickedWord;
-          break;
-        case 7:
-          seventhWord = clickedWord;
-          break;
-        case 8:
-          eighthWord = clickedWord;
-          break;
-        case 9:
-          ninethWord = clickedWord;
-          break;
-      }
-       
-        num = num + 1;
-
-      span.addEventListener('click', function() {
-          // Extract the word associated with the clicked span
-          const trimmedWord = this.textContent.trim().replace(/[^\w\s]/g, '');
-          const clickedWord = trimmedWord.charAt(0).toUpperCase() + trimmedWord.slice(1);
-          console.log('Clicked word:', clickedWord);
-          // make a request to the API to get the definition
-          fetchWordDefinition(clickedWord);
-      });
-
-      // Append each span to the span container
-      spanContainer.appendChild(span);
-  }
-
-  container.appendChild(spanContainer);
-
-  return [container]
-}
-
 
 class TextSubtitle extends SubtitleBase {
   constructor(...args) {
@@ -458,329 +353,57 @@ class TextSubtitle extends SubtitleBase {
     });
   }
 
-  _render(lines, options) {
-    // `em` as font size was not so good -- some other extensions change the em (?)
-    // these magic numbers looks good on my screen XD
-    // const fontSize = Math.sqrt(this.extentWidth / 1600) * 28;
-    const fontSize = Math.ceil(this.extentHeight / 30);
-
-    // .join('\n').split('\n') seems redundant but it's done because speaker-based captions will not contain a \n to
-    // indicate line breaks, instead they will come as individual elements in the lines array. Regular captions will
-    // come as a single element with a \n. So this is to make sure all caption formats are split into lines correctly.
-    const textContent = lines.map(line => line.text).join('\n').split('\n');
-    const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-    text.setAttributeNS(null, 'text-anchor', 'middle');
-    text.setAttributeNS(null, 'alignment-baseline', 'hanging');
-    text.setAttributeNS(null, 'dominant-baseline', 'hanging'); // firefox
-    text.setAttributeNS(null, 'paint-order', 'stroke');
-    text.setAttributeNS(null, 'stroke', 'black');
-    text.setAttributeNS(
-      null,
-      'stroke-width',
-      `${1.0 * options.secondaryTextStroke}px`
-    );
-    text.setAttributeNS(null, 'x', this.extentWidth * 0.5);
-    text.setAttributeNS(
-      null,
-      'y',
-      this.extentHeight * (options.lowerBaselinePos + 0.01)
-    );
-    text.setAttributeNS(null, 'opacity', options.secondaryTextOpacity);
-    text.style.fontSize = `${fontSize * options.secondaryTextScale}px`;
-    text.style.fontFamily = 'Arial, Helvetica';
-    text.style.fill = options.secondaryTextColor;
-    text.style.stroke = 'black';
-    // text.textContent = textContent;
-
-    // tspan for line breaks
-    textContent.forEach((line, i) => {
-      const tspan = document.createElementNS("http://www.w3.org/2000/svg","tspan");
-      tspan.setAttributeNS(null, 'x', this.extentWidth * 0.5);
-      if (i > 0) tspan.setAttributeNS(null, 'dy', text.style.fontSize);
-      tspan.textContent = line;
-      text.appendChild(tspan);
-    });
-
-    return [text];
-  }
-
-
- async _renderText(lines, options) {
-    const container = document.createElement('div');
-    container.style.textAlign = 'center'; // Set text alignment to center
-    container.style.position = 'absolute';
-    container.style.left = '50%';
-    container.style.transform = 'translateX(-50%)'; // Center horizontally
-
-    const fontSize = Math.ceil(this.extentHeight / 30);
-
-    // Join lines into a single string with newline characters
-    const textContent = lines.map(line => line.text).join('\n');
-
-    // Create a single <div> element for text
-    const textElement = document.createElement('div');
-    textElement.style.fontSize = `22px`;
-    textElement.style.fontFamily = 'Arial, Helvetica';
-    textElement.style.color = options.secondaryTextColor;
-    textElement.style.stroke = 'black'; // If needed, adjust stroke styling here
-    textElement.style.opacity = options.secondaryTextOpacity;
-    textElement.textContent = textContent;
-    textElement.style.whiteSpace = 'pre-wrap'; // Preserve line breaks
-
- 
-    // Feed into OpenAI to translate text to the user-specifed vocabulary level 
-
-    const selectedVocabularySize = '100'; // Example: select vocabulary size '300'
-    let words = textContent.split(' '); 
-
-    if (!textContent) { 
-      return [container]; // Return an empty container if textContent is empty
-    }
-
-      // Translate the text asynchronously
-    try {
-      const simplifiedText = await translateText(selectedVocabularySize, textContent);
-
-      // Handle the translated text here
-      console.log("Original: ", textContent);
-      console.log("Simplified: ", simplifiedText);
-      textElement.textContent =  simplifiedText;
-      words = simplifiedText.split(' ');
-      console.log("Words: ", words);
-
-      // Call the function to create span elements and assign click event listeners
-      const spanContainer = document.createElement('div');
-
-      // Wrap each word in a span element and assign a unique class
-      let num = 1;
-      for (const word of words) {
-          console.log("Word: ", word);
-          const span = document.createElement('span');
-          span.textContent = word + ' '; // Add space after each word
-          span.classList.add('word-' + num); // Assign a unique class
-
-          // Apply styling to match the text element
-          span.style.fontSize = '22px';
-          span.style.fontFamily = 'Arial, Helvetica';
-          span.style.color = options.secondaryTextColor;
-          span.style.stroke = 'black';
-          span.style.opacity = options.secondary;
-          span.style.whiteSpace = 'pre-wrap'; // Preserve line breaks
-
-          const clickedWord = span.textContent.trim();
-          switch(num)
-          {   
-            case 1:
-              firstWord = clickedWord;
-              break;
-            case 2:
-              secondWord = clickedWord
-            break;
-            case 3:
-              thirdWord = clickedWord;
-            break;
-            case 4:
-              fourthWord = clickedWord;
-              break;
-            case 5:
-              fifthWord = clickedWord;
-              break;
-            case 6:
-              sixthWord = clickedWord;
-              break;
-            case 7:
-              seventhWord = clickedWord;
-              break;
-            case 8:
-              eighthWord = clickedWord;
-              break;
-            case 9:
-              ninethWord = clickedWord;
-              break;
-          }
-            
-            num = num + 1;
-
-          span.addEventListener('click', function() {
-              // Extract the word associated with the clicked span
-              const trimmedWord = this.textContent.trim().replace(/[^\w\s]/g, '');
-              const clickedWord = trimmedWord.charAt(0).toUpperCase() + trimmedWord.slice(1);
-              console.log('Clicked word:', clickedWord);
-              // make a request to the API to get the definition
-              fetchWordDefinition(clickedWord);
-          });
-
-          // Append each span to the span container
-          spanContainer.appendChild(span);
+  async _renderText(lines, options) {
+    // .join('\n').split('\n') because speaker-based captions come as separate lines without a \n,
+    // while regular captions come as a single line containing \n
+    let text = lines.map(line => line.text).join('\n');
+    if (kSimplifySubtitlesWithOpenAI && text.trim()) {
+      const selectedVocabularySize = '100';
+      try {
+        text = (await translateText(selectedVocabularySize, text)) || text;
+      } catch (err) {
+        console.error('Error simplifying subtitles:', err);
       }
-
-        container.appendChild(spanContainer);
-        return [container];
-    } catch (error) {
-        // Handle errors here
-        console.error('Error:', error);
     }
-    /*
-    translateText(selectedVocabularySize, textContent)
-    .then(simplifiedText => {
-        // Handle the translated text here
-        console.log("Original: ", textContent);
-        console.log("Simplified: ", simplifiedText);
-        textElement.textContent =  simplifiedText;
-        words = simplifiedText.split(' ');
-        console.log("Words: ", words);
+    const textLines = text.split('\n')
+      .map(line => line.replace(/\s+/g, ' ').trim())
+      .filter(line => line);
 
-        // Call the function to create span elements and assign click event listeners
-        const spanContainer = document.createElement('div');
-      
-      
-        // Wrap each word in a span element and assign a unique class
-        let num = 1;
-        for (const word of words) {
-            console.log("Word: ", word);
-            const span = document.createElement('span');
-            span.textContent = word + ' '; // Add space after each word
-            span.classList.add('word-' + num); // Assign a unique class
-      
-            // Apply styling to match the text element
-            span.style.fontSize = '22px';
-            span.style.fontFamily = 'Arial, Helvetica';
-            span.style.color = options.secondaryTextColor;
-            span.style.stroke = 'black';
-            span.style.opacity = options.secondary;
-            span.style.whiteSpace = 'pre-wrap'; // Preserve line breaks
-      
-            const clickedWord = span.textContent.trim();
-            switch(num)
-            {   
-              case 1:
-                firstWord = clickedWord;
-                break;
-              case 2:
-                secondWord = clickedWord
-              break;
-              case 3:
-                thirdWord = clickedWord;
-              break;
-              case 4:
-                fourthWord = clickedWord;
-                break;
-              case 5:
-                fifthWord = clickedWord;
-                break;
-              case 6:
-                sixthWord = clickedWord;
-                break;
-              case 7:
-                seventhWord = clickedWord;
-                break;
-              case 8:
-                eighthWord = clickedWord;
-                break;
-              case 9:
-                ninethWord = clickedWord;
-                break;
-            }
-             
-              num = num + 1;
-      
-            span.addEventListener('click', function() {
-                // Extract the word associated with the clicked span
-                const trimmedWord = this.textContent.trim().replace(/[^\w\s]/g, '');
-                const clickedWord = trimmedWord.charAt(0).toUpperCase() + trimmedWord.slice(1);
-                console.log('Clicked word:', clickedWord);
-                // make a request to the API to get the definition
-                fetchWordDefinition(clickedWord);
-            });
-      
-            // Append each span to the span container
-            spanContainer.appendChild(span);
-        }
-      
-        //container.appendChild(spanContainer);
-      
-        return [spanContainer]
-    })
-    .catch(error => {
-        // Handle errors here
-        console.error('Error:', error);
-    });
+    gSubtitleWords = [];
+    const container = document.createElement('div');
+    if (!textLines.length) return [container];
 
+    // `em` as font size was not so good -- some other extensions change the em (?)
+    const fontSize = Math.ceil(this.extentHeight / 30) * options.secondaryTextScale;
+    const stroke = options.secondaryTextStroke;
+    const outline = [[-1, -1], [0, -1], [1, -1], [-1, 0], [1, 0], [-1, 1], [0, 1], [1, 1]]
+      .map(([x, y]) => `${x * stroke}px ${y * stroke}px 0 #000`)
+      .join(', ');
 
-    const spanContainer = document.createElement('div');
+    // hang just below the primary subtitles, which sit on the lower baseline
+    container.style.cssText = `position:absolute; left:5%; right:5%;
+      top:${(options.lowerBaselinePos + 0.01) * 100}%;
+      text-align:center; font-family:Arial, Helvetica, sans-serif; font-size:${fontSize}px; line-height:1.25;
+      color:${options.secondaryTextColor}; opacity:${options.secondaryTextOpacity};
+      text-shadow:${stroke > 0 ? outline : 'none'};`;
 
-    // Wrap each word in a span element and assign a unique class
-    let num = 1; 
-    words.forEach((word, index) => {
-        console.log("Word: ", word);
+    // one <span> per word: click it (or press 1-9) to look it up and add it to the word bank
+    textLines.forEach(line => {
+      const lineElem = document.createElement('div');
+      line.split(' ').forEach((word, i) => {
+        if (i > 0) lineElem.appendChild(document.createTextNode(' '));
         const span = document.createElement('span');
-        span.textContent = word + ' '; // Add space after each word
-        span.classList.add('word-' + index); // Assign a unique class
-
-        // Apply styling to match the text element
-        span.style.fontSize = textElement.style.fontSize;
-        span.style.fontFamily = textElement.style.fontFamily;
-        span.style.color = textElement.style.color;
-        span.style.stroke = textElement.style.stroke;
-        span.style.opacity = textElement.style.opacity;
-
-        const clickedWord = span.textContent.trim();
-        switch(num)
-        {   
-          case 1:
-            firstWord = clickedWord;
-            break;
-          case 2:
-            secondWord = clickedWord
-          break;
-          case 3:
-            thirdWord = clickedWord;
-          break;
-          case 4:
-            fourthWord = clickedWord;
-            break;
-          case 5:
-            fifthWord = clickedWord;
-            break;
-          case 6:
-            sixthWord = clickedWord;
-            break;
-          case 7:
-            seventhWord = clickedWord;
-            break;
-          case 8:
-            eighthWord = clickedWord;
-            break;
-          case 9:
-            ninethWord = clickedWord;
-            break;
-        }
-         
-          num = num + 1;
-
-
-
-        span.addEventListener('click', function() {
-            // Extract the word associated with the clicked span
-            const trimmedWord = this.textContent.trim().replace(/[^\w\s]/g, '');
-            const clickedWord = trimmedWord.charAt(0).toUpperCase() + trimmedWord.slice(1);
-            console.log('Clicked word:', clickedWord);
-            // make a request to the API to get the definition
-            fetchWordDefinition(clickedWord);
-        });
-
-        // span.click();
-
-        // Append each span to the span container
-        spanContainer.appendChild(span);
+        span.classList.add('nflxmultisubs-word');
+        span.textContent = word;
+        span.addEventListener('click', () => lookUpWord(word));
+        lineElem.appendChild(span);
+        gSubtitleWords.push(word);
+      });
+      container.appendChild(lineElem);
     });
-
-    container.appendChild(spanContainer);
 
     return [container];
-  }*/
-}
-
+  }
 }
 
 
@@ -903,9 +526,14 @@ class ImageSubtitle extends SubtitleBase {
 // -----------------------------------------------------------------------------
 
 class SubtitleFactory {
+  // Netflix renamed "ttDownloadables" to "downloadables" (same shape: { [profile]: { urls, isImage, ... } })
+  static downloadables(track) {
+    return track.downloadables || track.ttDownloadables || {};
+  }
+
   // track: manifest.textTracks[...]
   static build(track) {
-    const isImageBased = Object.values(track.ttDownloadables).some(d => d.isImage);
+    const isImageBased = Object.values(this.downloadables(track)).some(d => d.isImage);
     const isCaption = track.rawTrackType === 'closedcaptions';
     const lang = track.languageDescription + (isCaption ? ' [CC]' : '');
     const bcp47 = track.language;
@@ -928,10 +556,10 @@ class SubtitleFactory {
       return true;
     }
 
-    // "new_track_id" example "T:1:0;1;zh-Hant;1;1;"
-    // the last bit is 1 for NoneTrack text tracks
+    // "new_track_id" example "T:1:0;1;zh-Hant;1;1;" (now "id", e.g. "T:2:0;1;pl;1;1;0;0;")
+    // the bit at index 4 is 1 for NoneTrack text tracks
     try {
-      const isNoneTrackBit = track.new_track_id.split(';')[4];
+      const isNoneTrackBit = (track.id || track.new_track_id).split(';')[4];
       if (isNoneTrackBit === '1') {
         return true;
       }
@@ -947,13 +575,14 @@ class SubtitleFactory {
   }
 
   static _buildImageBased(track, lang, bcp47, isCaption) {
-    const maxHeight = Math.max(...Object.values(track.ttDownloadables).map(d => {
+    const downloadables = Object.values(this.downloadables(track));
+    const maxHeight = Math.max(...downloadables.map(d => {
       if(d.height)
         return d.height;
       else
         return -1;
     }));
-    const d = Object.values(track.ttDownloadables).find(d => d.height === maxHeight);
+    const d = downloadables.find(d => d.height === maxHeight);
     let urls;
     if (d.downloadUrls) {
       urls = Object.values(d.downloadUrls);
@@ -965,7 +594,7 @@ class SubtitleFactory {
 
   static _buildTextBased(track, lang, bcp47, isCaption) {
     const targetProfile = 'dfxp-ls-sdh';
-    const d = track.ttDownloadables[targetProfile];
+    const d = this.downloadables(track)[targetProfile];
     if (!d) {
       console.debug(`Cannot find "${targetProfile}" for ${lang}`);
       return null;
@@ -995,7 +624,7 @@ const buildSubtitleList = textTracks => {
 
 // textTracks: manifest.textTracks
 const updateSubtitleList = (textTracks, textTrackId) => {
-  const track = textTracks.find(t => t.new_track_id == textTrackId),
+  const track = textTracks.find(t => (t.id || t.new_track_id) == textTrackId),
     sub = SubtitleFactory.build(track),
     index = gSubtitles.findIndex(s => s.lang == sub.lang);
   if (gSubtitles[index] instanceof DehydratedSubtitle && sub !== null) {
@@ -1056,7 +685,7 @@ class SubtitleMenu {
       } else {
         item.innerHTML = `<div><div class="${this.style.subdiv}">${sub.lang}</div></div>`;
         item.addEventListener('click', () => {
-          activateSubtitle(id);
+          activateSubtitle(id, { remember: true });
         });
       }
       listElem.classList.add(this.style.ul);
@@ -1115,41 +744,31 @@ bodyObserver.observe(document.body, observerOptions);
 
 ////////////////////////////////////////////////////////////////////////////////
 
-activateSubtitle = id => {
+// `remember`: the user picked this subtitle, save it as the last used language
+const activateSubtitle = (id, { remember = false } = {}) => {
   const sub = gSubtitles[id];
   if (sub) {
     gSubtitles.forEach(sub => sub.deactivate());
     sub.activate().then(() => {gSubtitleMenu && gSubtitleMenu.render();});
 
-    gRenderOptions.secondaryLanguageLastUsed = sub.bcp47;
-    gRenderOptions.secondaryLanguageLastUsedIsCaption = sub.isCaption;
-
-    if (BROWSER === 'chrome') {
-      if (gMsgPort)
-        gMsgPort.postMessage({settings: gRenderOptions});
-    } else {
-      // Firefox
-      try {
-        window.postMessage({
-          namespace: 'nflxmultisubs',
-          action: 'update-settings',
-          settings: gRenderOptions
-        }, '*');
-      } catch (err) {
-        console.warn('Error: cannot talk to background,', err);
-      }
+    if (remember) {
+      // only send the changed keys, so other stored settings aren't overwritten
+      const lastUsed = {
+        secondaryLanguageLastUsed: sub.bcp47 || null, // null: "Off"
+        secondaryLanguageLastUsedIsCaption: !!sub.isCaption,
+      };
+      Object.assign(gRenderOptions, lastUsed);
+      sendToBackground({ settings: lastUsed });
     }
   }
   gSubtitleMenu && gSubtitleMenu.render();
 };
 
-const buildSecondarySubtitleElement = options => {
-  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  svg.classList.add('nflxmultisubs-subtitle-svg');
-  svg.style =
-    'position:absolute; width:100%; top:0; bottom:0; left:0; right:0;';
-  svg.setAttributeNS(null, 'width', '100%');
-  svg.setAttributeNS(null, 'height', '100%');
+const buildSecondarySubtitleTextElement = options => {
+  // covers the video area (same aspect ratio as the video), subtitles are positioned inside it in %
+  const paragraph = document.createElement('p');
+  paragraph.classList.add('nflxmultisubs-subtitle-text');
+  paragraph.style = 'position:absolute; top:0; bottom:0; left:0; right:0; margin:0;';
 
   const padding = document.createElement('div');
   padding.classList.add('nflxmultisubs-subtitle-padding');
@@ -1159,43 +778,21 @@ const buildSecondarySubtitleElement = options => {
   const container = document.createElement('div');
   container.classList.add('nflxmultisubs-subtitle-container');
   container.style = 'position:relative; width:100%; max-height:100%;';
-  container.appendChild(svg);
+  container.appendChild(paragraph);
   container.appendChild(padding);
+
+  // the wrapper covers the player, so let clicks through to it except on the words
+  const style = document.createElement('style');
+  style.textContent = `
+    .nflxmultisubs-word { pointer-events: auto; cursor: pointer; border-radius: 0.15em; }
+    .nflxmultisubs-word:hover { background-color: rgba(255, 255, 255, 0.25); }`;
 
   const wrapper = document.createElement('div');
   wrapper.classList.add('nflxmultisubs-subtitle-wrapper');
   wrapper.style =
-    'position:absolute; top:0; left:0; width:100%; height:100%; z-index:2; display:flex; align-items:center;';
+    'position:absolute; top:0; left:0; width:100%; height:100%; z-index:2; display:flex; align-items:center; pointer-events:none;';
+  wrapper.appendChild(style);
   wrapper.appendChild(container);
-  return wrapper;
-};
-
-const buildSecondarySubtitleTextElement = options => {
-
-  const paragraph = document.createElement('p');
-  paragraph.classList.add('secondary-subtitle-text'); // TODO: actually set this
-  paragraph.style =
-    'position:absolute; width:100%; top:0; bottom:0; left:0; right:0;';
-  paragraph.setAttribute('width', '100%'); // Use setAttribute for width and height
-  paragraph.setAttribute('height', '100%');
-
-  const padding = document.createElement('div');
-  padding.classList.add('secondary-subtitle-padding'); // Updated class name
-  padding.style = `display:block; content:' '; width:100%; padding-top:${gVideoRatio *
-    100}%;`;
-
-  const container = document.createElement('div');
-  container.classList.add('secondary-subtitle-container'); // Updated class name
-  container.style = 'position:relative; width:100%; max-height:100%;';
-  container.appendChild(paragraph); // Append the paragraph instead of SVG
-  container.appendChild(padding);
-
-  const wrapper = document.createElement('div');
-  wrapper.classList.add('secondary-subtitle-wrapper'); // Updated class name
-  wrapper.style =
-    'position:absolute; top:0; left:0; width:100%; height:100%; z-index:2; display:flex; align-items:center;';
-  wrapper.appendChild(container);
-  
   return wrapper;
 };
 
@@ -1384,7 +981,6 @@ class RendererLoop {
     this.isRenderDirty = undefined; // windows resize or config change, force re-render
     this.videoElem = video;
     this.subtitleWrapperElem = undefined; // secondary subtitles wrapper (outer)
-    this.subSvg = undefined; // secondary subtitles container
     this.subText = undefined; // secondary subtitles text container
     this.primaryImageTransformer = new PrimaryImageTransformer();
     this.primaryTextTransformer = new PrimaryTextTransformer();
@@ -1397,41 +993,13 @@ class RendererLoop {
   start() {
     this.isRunning = true;
     window.requestAnimationFrame(this.loop.bind(this));
-    if (BROWSER === 'chrome') {
-      if (gMsgPort)
-        gMsgPort.postMessage({ startPlayback: 1 });
-    }else {
-      // Firefox
-      try {
-        window.postMessage({
-          namespace: 'nflxmultisubs',
-          action: 'startPlayback'
-        }, '*');
-      } catch (err) {
-        console.warn('Error: cannot talk to background,', err);
-      }
-    }
-    //this._connect();
+    sendToBackground({ startPlayback: 1 }); // colors our toolbar icon
   }
 
   stop() {
     this.isRunning = false;
-    this._clearSecondarySubtitles();
-    if (BROWSER === 'chrome') {
-      if (gMsgPort)
-        gMsgPort.postMessage({ stopPlayback: 1 });
-    }else {
-      // Firefox
-      try {
-        window.postMessage({
-          namespace: 'nflxmultisubs',
-          action: 'stopPlayback'
-        }, '*');
-      } catch (err) {
-        console.warn('Error: cannot talk to background,', err);
-      }
-    }
-    //this._disconnect();
+    this._clearSecondarySubtitlesText();
+    sendToBackground({ stopPlayback: 1 }); // grays out our toolbar icon
   }
 
   async loop() {
@@ -1476,69 +1044,12 @@ class RendererLoop {
     this._adjustPrimarySubtitles(controlsActive, !!this.isRenderDirty);
     await this._renderSecondarySubtitlesText();
 
-    // render secondary subtitles
-    // ---------------------------------------------------------------------
-    // FIXME: dirty transform & magic offets
-    // this leads to a big gap between primary & secondary subtitles
-    // when the progress bar is shown
-    // this.subtitleWrapperElem.style.top = controlsActive ? '-100px' : '0';
+    // PrimaryTextTransformer moves the primary subtitles up by 100px while the controls are shown,
+    // move the secondary ones along so they stay together
+    this.subtitleWrapperElem.style.transform = controlsActive ? 'translateY(-100px)' : '';
 
     // everything rendered, clear the dirty bit with ease
     this.isRenderDirty = false;
-  }
-
-  _connect() {
-    // connect with background script
-    // FIXME: should disconnect this port while there's no video playing, to gray out our icon;
-    // However, we can't disconnect when <video> not found in the renderer loop,
-    // because there's a small time gap between updateManifest() and <video> is initialize.
-    if (BROWSER === 'chrome') {
-      if (gMsgPort) return;
-      try {
-        const extensionId = window.__nflxMultiSubsExtId;
-        gMsgPort = chrome.runtime.connect(extensionId);
-        console.log(`Linked: ${extensionId}`);
-
-        gMsgPort.onMessage.addListener(msg => {
-          if (msg.settings) {
-            gRenderOptions = Object.assign({}, msg.settings);
-            gRendererLoop && gRendererLoop.setRenderDirty();
-          }
-          else if (msg.wordBank) {
-            gWordBank = Object.assign([], msg.wordBank);
-          }
-        });
-      } catch (err) {
-        console.warn('Error: cannot talk to background,', err);
-      }
-      return;
-    }
-
-    // Firefox
-    try {
-      window.postMessage({
-        namespace: 'nflxmultisubs',
-        action: 'connect'
-      }, '*');
-    } catch (err) {
-      console.warn('Error: cannot talk to background,', err);
-    }
-  }
-
-  _disconnect() {
-    // disconnect with background to make our icon grayscale again
-    // FIXME: renderer loop shouldn't be responsible for this
-    if (BROWSER === 'chrome') {
-      if (gMsgPort && gMsgPort.disconnect()) gMsgPort = null;
-    } else if (BROWSER === 'firefox') {
-      window.postMessage(
-        {
-          namespace: 'nflxmultisubs',
-          action: 'disconnect'
-        },
-        '*'
-      );
-    }
   }
 
   _getControlsActive() {
@@ -1571,7 +1082,6 @@ class RendererLoop {
     if (!this.subtitleWrapperElem || !this.subtitleWrapperElem.parentNode) {
       const playerContainerElem = document.querySelector('div[data-uia="video-canvas"]');
       if (!playerContainerElem) return false;
-      // this.subtitleWrapperElem = buildSecondarySubtitleElement(gRenderOptions);
       this.subtitleWrapperElem = buildSecondarySubtitleTextElement(gRenderOptions);
       playerContainerElem.appendChild(this.subtitleWrapperElem);
     }
@@ -1599,54 +1109,12 @@ class RendererLoop {
     this.lastControlsActive = active;
   }
 
-  _clearSecondarySubtitles() {
-    if (!this.subSvg || !this.subSvg.parentNode) return;
-    [].forEach.call(this.subSvg.querySelectorAll('*'), elem =>
-      elem.parentNode.removeChild(elem));
-  }
-
   _clearSecondarySubtitlesText() {
     if (!this.subText || !this.subText.parentNode) return;
     while (this.subText.firstChild) {
       this.subText.removeChild(this.subText.firstChild); // remove the children to clear subtitle text 
     }
   }
-
-  _renderSecondarySubtitles() {
-    if (!this.subSvg || !this.subSvg.parentNode) {
-      this.subSvg = this.subtitleWrapperElem.querySelector('svg');
-    }
-    const seconds = this.videoElem.currentTime;
-    const sub = gSubtitles.find(sub => sub.active);
-    if (!sub) {
-      return;
-    }
-
-    if (sub instanceof TextSubtitle) {
-      const rect = this.videoElem.getBoundingClientRect();
-      sub.setExtent(rect.width, rect.height);
-    }
-
-    const renderedElems = sub.render(
-      seconds,
-      gRenderOptions,
-      !!this.isRenderDirty
-    );
-
-    if (renderedElems) {
-      const [extentWidth, extentHeight] = sub.getExtent();
-      if (extentWidth && extentHeight) {
-        this.subSvg.setAttribute(
-          'viewBox',
-          `0 0 ${extentWidth} ${extentHeight}`
-        );
-      }
-      this._clearSecondarySubtitles();
-      renderedElems.forEach(elem => this.subSvg.appendChild(elem));
-    }
-  }
-
-
 
   async _renderSecondarySubtitlesText() {
     if (!this.subText || !this.subText.parentNode) {
@@ -1674,7 +1142,6 @@ class RendererLoop {
       // const [extentWidth, extentHeight] = sub.getExtent();
       this._clearSecondarySubtitlesText();
       renderedElems.forEach(elem => this.subText.appendChild(elem));
-      console.log('rendered: ', renderedElems);
     }
   }
 }
@@ -1813,8 +1280,9 @@ class NflxMultiSubsManager {
 
     // Sometime the movieId in URL may be different to the actually playing manifest
     // Thus we also need to check the player DOM tree...
-    this.busyWaitVideoElement()
-      .then(video => {
+    // (also wait for the stored settings, which decide the secondary language)
+    Promise.all([this.busyWaitVideoElement(), gSettingsReady])
+      .then(([video]) => {
         try {
           const movieIdInUrl = extractMovieIdFromUrl();
           let playingManifest = (manifest.movieId === movieId);
@@ -1833,9 +1301,14 @@ class NflxMultiSubsManager {
             return;
           }
 
+          // Netflix renamed manifest fields (timedtexttracks -> textTracks, audio_tracks -> audioTracks, ...)
+          const textTracks = manifest.textTracks || manifest.timedtexttracks;
+          const audioTracks = manifest.audioTracks || manifest.audio_tracks;
+          const videoTracks = manifest.videoTracks || manifest.video_tracks;
+
           const movieChanged = manifest.movieId !== this.lastMovieId;
           if (!movieChanged) {
-            updateSubtitleList(manifest.timedtexttracks, manifest.recommendedMedia.timedTextTrackId);
+            updateSubtitleList(textTracks, manifest.recommendedMedia.textTrackId || manifest.recommendedMedia.timedTextTrackId);
             console.log(`Manifest ${manifest.movieId} updated`);
             return;
           }
@@ -1844,64 +1317,16 @@ class NflxMultiSubsManager {
           this.lastMovieId = manifest.movieId;
 
           // For cadmium-playercore-6.0012.183.041.js and later
-          gSubtitles = buildSubtitleList(manifest.timedtexttracks);
-          //gSubtitleMenu = new SubtitleMenu();
-          //gSubtitleMenu.render();
+          gSubtitles = buildSubtitleList(textTracks);
+          // the menu may have been built before the list existed
+          gSubtitleMenu && gSubtitleMenu.render();
 
           // select subtitle based on language settings
-          console.log('Language mode: ', gRenderOptions.secondaryLanguageMode);
-          switch(String(gRenderOptions.secondaryLanguageMode)){
-            case 'disabled':
-              console.log('Subs disabled.');
-              break;
-            default:
-            case 'audio':
-              try {
-                /* Note 2021/11/04 :
-                    manifest.defaultTrackOrderList doesn't exist anymore. We can use the audio track's isNative flag instead.
-                    There is also manifest.recommendedMedia.audioTrackId , but it just points to the track with isNative == true. */
-                //const defaultAudioId = manifest.defaultTrackOrderList[0].audioTrackId;
-                const defaultAudioTrack = manifest.audio_tracks.find(t => t.isNative == true);
-                const defaultAudioLanguage = (defaultAudioTrack) ? defaultAudioTrack.language : manifest.audio_tracks[0].language; // fall back to first track if isNative fails
-                console.log(`Default audio track language: ${defaultAudioLanguage}`);
-                const autoSubtitleId = gSubtitles.findIndex(t => t.bcp47 == defaultAudioLanguage);
-                if (autoSubtitleId >= 0) {
-                  console.log(`Subtitle #${autoSubtitleId} auto-enabled to match audio`);
-                  activateSubtitle(autoSubtitleId);
-                }else{
-                  console.log(defaultAudioLanguage + ' subs not available.');
-                }
-              }
-              catch (err) {
-                console.error('Default audio track not found, ', err);
-              }
-              break;
-            case 'last':
-              if (gRenderOptions.secondaryLanguageLastUsed){
-                console.log('Activating last sub language', gRenderOptions.secondaryLanguageLastUsed)
-                try{
-                  let lastSubtitleId = gSubtitles.findIndex(t => (t.bcp47 == gRenderOptions.secondaryLanguageLastUsed && t.isCaption == gRenderOptions.secondaryLanguageLastUsedIsCaption));
-                  // if can't match CC type, fall back to language only
-                  if (lastSubtitleId == -1)
-                    lastSubtitleId = gSubtitles.findIndex(t => t.bcp47 == gRenderOptions.secondaryLanguageLastUsed);
-                  if (lastSubtitleId >= 0) {
-                    console.log(`Subtitle #${lastSubtitleId} enabled`);
-                    activateSubtitle(lastSubtitleId);
-                  }else{
-                    console.log(gRenderOptions.secondaryLanguageLastUsed + ' subs not available.');
-                  }
-                } catch (err){
-                  console.error('Error activating last sub language, ', err);
-                }
-              }else{
-                console.log('Last used language is empty, subs disabled.');
-              }
-              break;
-          }
+          this.selectSecondarySubtitle(audioTracks);
 
           // retrieve video ratio
           try {
-            let { maxWidth, maxHeight } = manifest.video_tracks[0];
+            let { maxWidth, maxHeight } = videoTracks[0];
             gVideoRatio = maxHeight / maxWidth;
           }
           catch (err) {
@@ -1931,6 +1356,56 @@ class NflxMultiSubsManager {
       .catch(err => {
         console.error('Fatal: ', err);
       });
+  }
+
+  // pick the secondary subtitle according to the language mode in the settings
+  selectSecondarySubtitle(audioTracks) {
+    const mode = String(gRenderOptions.secondaryLanguageMode);
+    console.log('Language mode: ', mode);
+    if (mode === 'disabled') return;
+
+    const findSubtitle = (bcp47, isCaption) => gSubtitles.findIndex(t =>
+      !(t instanceof DehydratedSubtitle) && t.bcp47 == bcp47 && (isCaption === undefined || t.isCaption == isCaption));
+
+    if (mode === 'last') {
+      const lastUsed = gRenderOptions.secondaryLanguageLastUsed;
+      if (lastUsed === null) {
+        console.log('Last used language is "Off", subs disabled.');
+        return;
+      }
+      if (lastUsed) {
+        // if can't match CC type, fall back to language only
+        let lastSubtitleId = findSubtitle(lastUsed, gRenderOptions.secondaryLanguageLastUsedIsCaption);
+        if (lastSubtitleId == -1)
+          lastSubtitleId = findSubtitle(lastUsed);
+        if (lastSubtitleId >= 0) {
+          console.log(`Subtitle #${lastSubtitleId} enabled (last used)`);
+          activateSubtitle(lastSubtitleId);
+          return;
+        }
+        console.log(`${lastUsed} subs not available, matching audio language instead.`);
+      }
+      // nothing picked yet (or not available for this title): match the audio language
+    }
+
+    try {
+      /* Note 2021/11/04 :
+          manifest.defaultTrackOrderList doesn't exist anymore. We can use the audio track's isNative flag instead.
+          There is also manifest.recommendedMedia.audioTrackId , but it just points to the track with isNative == true. */
+      const defaultAudioTrack = audioTracks.find(t => t.isNative == true) || audioTracks[0]; // fall back to first track if isNative fails
+      const defaultAudioLanguage = defaultAudioTrack.language;
+      console.log(`Default audio track language: ${defaultAudioLanguage}`);
+      const autoSubtitleId = findSubtitle(defaultAudioLanguage);
+      if (autoSubtitleId >= 0) {
+        console.log(`Subtitle #${autoSubtitleId} auto-enabled to match audio`);
+        activateSubtitle(autoSubtitleId);
+      } else {
+        console.log(defaultAudioLanguage + ' subs not available.');
+      }
+    }
+    catch (err) {
+      console.error('Default audio track not found, ', err);
+    }
   }
 
   updateManifest(manifest) {
@@ -1970,117 +1445,22 @@ playbackRateController.activate();
 window.addEventListener('keydown', (event) => {
   // toggle subtitles visibility with 'v'
   if (event.key.toLowerCase() === 'v') {
-    const primary = document.querySelector('.nflxmultisubs-primary-wrapper');
-    const secondary = document.querySelector('.nflxmultisubs-subtitle-wrapper');
-
-    if (!primary || !secondary)
+    const wrappers = Array.from(document.querySelectorAll('.nflxmultisubs-primary-wrapper, .nflxmultisubs-subtitle-wrapper'));
+    if (!wrappers.length)
       return;
 
-    const visible = (window.getComputedStyle(primary).visibility === 'visible') ||
-        (window.getComputedStyle(secondary).visibility === 'visible');
-
-    primary.style.visibility = secondary.style.visibility = (visible) ? 'hidden' : 'visible';
+    const visible = wrappers.some(w => window.getComputedStyle(w).visibility === 'visible');
+    wrappers.forEach(w => w.style.visibility = (visible) ? 'hidden' : 'visible');
   }
 }, true);
 
 
 
-function OneEvent(event) {
-  if (event.key === '1') {
-    if (event.type === 'keydown' && event.repeat === false) {
+// press 1-9 to look up the n-th word of the secondary subtitle on screen and add it to the word bank
+document.addEventListener('keydown', (event) => {
+  if (event.repeat || event.metaKey || event.ctrlKey || event.altKey) return;
+  if (!/^[1-9]$/.test(event.key)) return;
 
-      // Extract the word associated with the clicked span
-      const trimmedWord = firstWord.trim().replace(/[^\w\s]/g, '');
-      const clickedWord = trimmedWord.charAt(0).toUpperCase() + trimmedWord.slice(1);
-      console.log('Clicked word:', clickedWord);
-
-      // make a request to the API to get the definition
-      fetchWordDefinition(clickedWord);
-
-    }
-  }  
-  if (event.key === '2') {
-    if (event.type === 'keydown' && event.repeat === false) {
-      // Extract the word associated with the clicked span
-      const trimmedWord = secondWord.trim().replace(/[^\w\s]/g, '');
-      const clickedWord = trimmedWord.charAt(0).toUpperCase() + trimmedWord.slice(1);
-      console.log('Clicked word:', clickedWord);
-
-      // make a request to the API to get the definition
-      fetchWordDefinition(clickedWord);
-    }
-  }    
-  if (event.key === '3') {
-    if (event.type === 'keydown' && event.repeat === false) {
-      // Extract the word associated with the clicked span
-      const trimmedWord = thirdWord.trim().replace(/[^\w\s]/g, '');
-      const clickedWord = trimmedWord.charAt(0).toUpperCase() + trimmedWord.slice(1);
-      console.log('Clicked word:', clickedWord);
-
-      // make a request to the API to get the definition
-      fetchWordDefinition(clickedWord);
-    }
-  }    
-  if (event.key === '4') {
-    if (event.type === 'keydown' && event.repeat === false) {
-      // Extract the word associated with the clicked span
-      const trimmedWord = fourthWord.trim().replace(/[^\w\s]/g, '');
-      const clickedWord = trimmedWord.charAt(0).toUpperCase() + trimmedWord.slice(1);
-      console.log('Clicked word:', clickedWord);
-
-      // make a request to the API to get the definition
-      fetchWordDefinition(clickedWord);
-    }
-  }    
-  if (event.key === '5') {
-    if (event.type === 'keydown' && event.repeat === false) {
-      const trimmedWord = fifthWord.trim().replace(/[^\w\s]/g, '');
-      const clickedWord = trimmedWord.charAt(0).toUpperCase() + trimmedWord.slice(1);
-      console.log('Clicked word:', clickedWord);
-
-      // make a request to the API to get the definition
-      fetchWordDefinition(clickedWord);
-    }
-  }    
-  if (event.key === '6') {
-    if (event.type === 'keydown' && event.repeat === false) {
-      const trimmedWord = sixthWord.trim().replace(/[^\w\s]/g, '');
-      const clickedWord = trimmedWord.charAt(0).toUpperCase() + trimmedWord.slice(1);
-      console.log('Clicked word:', clickedWord);
-
-      // make a request to the API to get the definition
-      fetchWordDefinition(clickedWord);
-    }
-  }    
-  if (event.key === '7') {
-    if (event.type === 'keydown' && event.repeat === false) {
-      const trimmedWord = seventhWord.trim().replace(/[^\w\s]/g, '');
-      const clickedWord = trimmedWord.charAt(0).toUpperCase() + trimmedWord.slice(1);
-      console.log('Clicked word:', clickedWord);
-
-      // make a request to the API to get the definition
-      fetchWordDefinition(clickedWord);
-    }
-  }    
-  if (event.key === '8') {
-    if (event.type === 'keydown' && event.repeat === false) {
-      const trimmedWord = eighthWord.trim().replace(/[^\w\s]/g, '');
-      const clickedWord = trimmedWord.charAt(0).toUpperCase() + trimmedWord.slice(1);
-      console.log('Clicked word:', clickedWord);
-
-      // make a request to the API to get the definition
-      fetchWordDefinition(clickedWord);
-    }
-  }    
-  if (event.key === '9') {
-    if (event.type === 'keydown' && event.repeat === false) {
-      const trimmedWord = ninthWord.trim().replace(/[^\w\s]/g, '');
-      const clickedWord = trimmedWord.charAt(0).toUpperCase() + trimmedWord.slice(1);
-      console.log('Clicked word:', clickedWord);
-
-      // make a request to the API to get the definition
-      fetchWordDefinition(clickedWord);
-    }
-  }      
-}  
-document.addEventListener('keydown', OneEvent);
+  const word = gSubtitleWords[parseInt(event.key) - 1];
+  if (word) lookUpWord(word);
+});

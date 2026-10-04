@@ -5,7 +5,7 @@ const kDefaultSettings = require('./default-settings');
 
 
 let gSettings = Object.assign({}, kDefaultSettings);
-let gWordBank = []
+let gWordBank = [];
 
 // return true if valid; otherwise return false
 function validateSettings(settings) {
@@ -14,12 +14,18 @@ function validateSettings(settings) {
 }
 
 
-chrome.storage.local.get(['settings'], (result) => {
-  console.log('Loaded: settings=', result.settings);
-  if (result.settings && validateSettings(result.settings))
-    gSettings = result.settings;
-  else
+// Connections can arrive before storage is loaded (e.g. when the background is started by a page
+// connecting), so don't answer or apply changes until then -- otherwise the page gets the defaults.
+const gStorageLoaded = new Promise(resolve => {
+  chrome.storage.local.get(['settings', 'wordBank'], (result) => {
+    console.log('Loaded: settings=', result.settings, 'wordBank=', result.wordBank);
+    // fill in keys missing from stored settings (new settings, or `undefined` values dropped by storage)
+    // instead of throwing the user's settings away
+    gSettings = Object.assign({}, kDefaultSettings, result.settings);
+    if (Array.isArray(result.wordBank)) gWordBank = result.wordBank;
     saveSettings();
+    resolve();
+  });
 });
 
 function saveSettings() {
@@ -33,20 +39,22 @@ function saveSettings() {
   });
 }
 
-// Initialize the word bank in Chrome storage if it doesn't exist
-chrome.storage.local.get(['wordBank'], (result) => {
-  console.log('Loaded: wordBank =', result.wordBank);
-  if (!result.wordBank) {
-      chrome.storage.local.set({ 'wordBank': [] });
-  }
-  else 
-    saveWordBank();
-});
-
 function saveWordBank() {
   chrome.storage.local.set({ wordBank: gWordBank }, () => {
     console.log('Word Bank: saved into local storage');
   });
+}
+
+function isSameWord(a, b) {
+  return a.word.toLowerCase() === b.word.toLowerCase();
+}
+
+function addWord(wordDefinition) {
+  if (!wordDefinition || !wordDefinition.word) return;
+  if (gWordBank.some(w => isSameWord(w, wordDefinition))) return;
+  gWordBank.push(wordDefinition);
+  saveWordBank();
+  dispatchWordBank();
 }
 
 // ----------------------------------------------------------------------------
@@ -75,10 +83,9 @@ function desaturateActionIconForTab(tabId) {
 // -----------------------------------------------------------------------------
 
 
-let gExtPorts = {}; // tabId -> msgPort; for config dispatching
+let gAgentPorts = {}; // tabId -> msgPort; for config dispatching
 function dispatchSettings() {
-  const keys = Object.keys(gExtPorts);
-  keys.map(k => gExtPorts[k]).forEach(port => {
+  Object.values(gAgentPorts).forEach(port => {
     try {
       port.postMessage({ settings: gSettings });
     }
@@ -88,61 +95,53 @@ function dispatchSettings() {
   });
 }
 
+// merge (partial) settings sent by the agent or the pop-up, then save and broadcast them
+function updateSettings(settings) {
+  const merged = Object.assign({}, gSettings, settings);
+  gSettings = validateSettings(merged) ? merged : Object.assign({}, kDefaultSettings);
+  saveSettings();
+  dispatchSettings();
+}
 
-// connected from target website (our injected agent)
-function handleExternalConnection(port) {
+
+// connected from target website (our injected agent, relayed by the content script)
+function handleAgentConnection(port) {
   const tabId = port.sender && port.sender.tab && port.sender.tab.id;
   if (!tabId) return;
 
-  gExtPorts[tabId] = port;
+  gAgentPorts[tabId] = port;
   console.log(`Connected: ${tabId} (tab)`);
 
-  port.postMessage({ settings: gSettings });
+  gStorageLoaded.then(() => port.postMessage({ settings: gSettings }));
 
-  port.onMessage.addListener(msg => {
+  port.onMessage.addListener(msg => gStorageLoaded.then(() => {
     if (msg.settings) {
       console.log('Received from injected agent: settings=', msg.settings);
-      let settings = Object.assign({}, gSettings);
-      settings = Object.assign(settings, msg.settings);
-      if (!validateSettings(settings)) {
-        gSettings = Object.assign({}, kDefaultSettings);
-        port.postMessage({ settings: gSettings });
-      }
-      else {
-        gSettings = settings;
-      }
-      saveSettings();
-      dispatchSettings();
+      updateSettings(msg.settings);
     }
-    else if(msg.startPlayback){
-      console.log('Saturate icon')
+    else if (msg.startPlayback) {
       saturateActionIconForTab(tabId);
     }
-    else if(msg.stopPlayback){
-      console.log('Desaturate icon')
+    else if (msg.stopPlayback) {
       desaturateActionIconForTab(tabId);
     }
-    else if (msg.wordBank) {
-      console.log('Received from injected agent: wordBank=', msg.wordBank);
-      gWordBank = msg.wordBank;
-      saveWordBank();
-      dispatchWordBank();
+    else if (msg.addWord) {
+      console.log('Received from injected agent: word=', msg.addWord);
+      addWord(msg.addWord);
     }
-    else {
-
-    }
-  });
+  }));
 
   port.onDisconnect.addListener(() => {
-    delete gExtPorts[tabId];
+    delete gAgentPorts[tabId];
     console.log(`Disconnected: ${tabId} (tab)`);
   });
 }
 
-// dispatch word bank to the internal port! 
+// dispatch word bank to the pop-up
 function dispatchWordBank() {
+  if (!gPopupPort) return;
   try {
-    gIntPort.postMessage({ wordBank: gWordBank });
+    gPopupPort.postMessage({ wordBank: gWordBank });
   }
   catch (err) {
     console.error('Error: cannot dispatch word bank,', err);
@@ -150,63 +149,44 @@ function dispatchWordBank() {
 }
 
 
-let gIntPort; 
+let gPopupPort;
 
 // connected from our pop-up page
-function handleInternalConnection(port) {
- const portName = port.name;
- console.log(`Connected: ${portName} (internal)`);
+function handlePopupConnection(port) {
+  console.log('Connected: settings (pop-up)');
+  gPopupPort = port;
 
- gIntPort = port;
+  gStorageLoaded.then(() => {
+    port.postMessage({ settings: gSettings });
+    port.postMessage({ wordBank: gWordBank });
+  });
 
- if (portName === 'settings') {
-   port.postMessage({ settings: gSettings });
-   port.postMessage({ wordBank: gWordBank });
-
-   port.onMessage.addListener(msg => {
-     if (!msg.settings) {
-       gSettings = Object.assign({}, kDefaultSettings);
-       port.postMessage({ settings: gSettings });
-     }
-     else {
-       console.log('Received: settings=', msg.settings);
-       let settings = Object.assign({}, gSettings);
-       settings = Object.assign(settings, msg.settings);
-       if (!validateSettings(settings)) {
-         gSettings = Object.assign({}, kDefaultSettings);
-         port.postMessage({ settings: gSettings });
-       }
-       else {
-         gSettings = settings;
-       }
-     }
-     saveSettings();
-     dispatchSettings();
-   });
- }
-
- port.onDisconnect.addListener(() => {
-   console.log(`Disconnected: ${portName} (internal)`);
- });
-}
-
-
-// handle connections from target website and our pop-up
-if (BROWSER === 'chrome') {
-  chrome.runtime.onConnectExternal.addListener(
-    port => handleExternalConnection(port));
-
-  chrome.runtime.onConnect.addListener(
-    port => handleInternalConnection(port));
-}
-else {
-  // Firefox: either from website (injected agent) or pop-up are all "internal"
-  chrome.runtime.onConnect.addListener(port => {
-    if (port.sender && port.sender.tab) {
-      handleExternalConnection(port);
+  port.onMessage.addListener(msg => gStorageLoaded.then(() => {
+    if (!msg.settings) {
+      // "Reset to Default"
+      gSettings = Object.assign({}, kDefaultSettings);
+      saveSettings();
+      dispatchSettings();
+      port.postMessage({ settings: gSettings });
     }
     else {
-      handleInternalConnection(port);
+      console.log('Received: settings=', msg.settings);
+      updateSettings(msg.settings);
     }
+  }));
+
+  port.onDisconnect.addListener(() => {
+    if (gPopupPort === port) gPopupPort = null;
+    console.log('Disconnected: settings (pop-up)');
   });
 }
+
+
+chrome.runtime.onConnect.addListener(port => {
+  if (port.name === 'settings') {
+    handlePopupConnection(port);
+  }
+  else if (port.name === 'agent') {
+    handleAgentConnection(port);
+  }
+});
