@@ -8,7 +8,8 @@
   "scripts": {
     "build": "node utils/build.js",
     "build-debug": "cross-env DISABLE_MINI=1 node utils/build.js",
-    "pack": "node utils/pack.js"
+    "pack": "node utils/pack.js",
+    "test": "node utils/test-background.js"
   },
   "devDependencies": {
     "clean-webpack-plugin": "^4.0.0",
@@ -16,7 +17,6 @@
     "cross-env": "^7.0.3",
     "fs-extra": "^10.0.0",
     "jszip": "^3.7.1",
-    "openai": "^7.27.0",
     "vanilla-picker": "^2.12.1",
     "webpack": "^5.61.0"
   }

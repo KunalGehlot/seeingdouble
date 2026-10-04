@@ -30,6 +30,8 @@ port.onMessage.addListener((msg) => {
 
   primaryPicker?.setColor(settings.primaryTextColor || "#ffffff", true);
   secondaryPicker?.setColor(settings.secondaryTextColor || "#ffffff", true);
+
+  if ('hasOpenAiApiKey' in msg) renderOpenAiKeyStatus(msg.hasOpenAiApiKey);
 });
 
 // -----------------------------------------------------------------------------
@@ -70,7 +72,19 @@ function uploadSettings() {
 }
 
 function resetSettings() {
-  port.postMessage({ settings: null });
+  port.postMessage({ resetSettings: true });
+}
+
+function updateOpenAiApiKey(key) {
+  port.postMessage({ openaiApiKey: key });
+}
+
+function renderOpenAiKeyStatus(hasKey) {
+  const statusElem = document.getElementById('openai-key-status');
+  if (statusElem) statusElem.textContent = hasKey ? '✓ saved' : '';
+
+  const removeLink = document.getElementById('btnRemoveKey');
+  if (removeLink) removeLink.style.display = hasKey ? '' : 'none';
 }
 
 
@@ -145,6 +159,10 @@ function renderActiveSettings() {
     if(settings.secondaryLanguageLastUsed)
       document.getElementById('langcode').innerHTML = settings.secondaryLanguageLastUsed.split('-')[0] // only display language code, not script tag (eg: zh not zh-Hans)
   }
+
+  // AI simplification
+  document.getElementById('simplify-enabled').checked = !!settings.simplifySubtitlesWithAI;
+  document.getElementById('simplify-level').value = settings.simplifyVocabularyLevel || '300';
 
   renderWordBank();
 }
@@ -259,6 +277,27 @@ window.addEventListener('load', evt => {
     const languageId = parseInt(div.getAttribute('data-id'));
     div.addEventListener('click', evt => updateSecondaryLanguage(languageId), false);
   });
+
+  document.getElementById('simplify-enabled').addEventListener('change', evt => {
+    settings = Object.assign(settings, { simplifySubtitlesWithAI: evt.target.checked });
+    uploadSettings();
+  });
+
+  document.getElementById('simplify-level').addEventListener('change', evt => {
+    settings = Object.assign(settings, { simplifyVocabularyLevel: evt.target.value });
+    uploadSettings();
+  });
+
+  const openaiKeyField = document.getElementById('openai-key');
+  openaiKeyField.addEventListener('change', evt => {
+    if (!evt.target.value) return; // blurring an empty field isn't "remove the key" -- use the link below
+    updateOpenAiApiKey(evt.target.value);
+    evt.target.value = ''; // never keep the key visible/in the DOM after saving it
+  });
+
+  document.getElementById('btnRemoveKey').addEventListener('click', evt => {
+    updateOpenAiApiKey('');
+  }, false);
 
   const btnReset = document.getElementById('btnReset');
   btnReset.addEventListener('click', evt => {

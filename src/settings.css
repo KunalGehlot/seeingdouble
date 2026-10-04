@@ -283,6 +283,23 @@ footer {
   overflow-y: auto;
 }
 
+.settings-ai-simplify .disclosure {
+  color: hsl(0, 0%, 50%);
+  font-size: 10px;
+  margin: 6px 10px 0 10px;
+  text-align: left;
+}
+
+.settings-ai-simplify input,
+.settings-ai-simplify select {
+  user-select: text;
+}
+
+#openai-key-status {
+  color: hsl(130, 50%, 35%);
+  margin-left: 4px;
+}
+
 word-bank-container p:hover {
   cursor: pointer;
   text-decoration: underline;

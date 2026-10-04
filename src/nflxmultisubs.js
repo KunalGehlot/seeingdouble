@@ -2,7 +2,6 @@ const console = require('./console');
 const JSZip = require('jszip');
 const kDefaultSettings = require('./default-settings');
 const PlaybackRateController = require('./playback-rate-controller');
-const { OpenAI } = require('openai');
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -83,6 +82,11 @@ const gSettingsReady = new Promise(resolve => {
   }, 1500);
 });
 
+// pending simplify() calls, keyed by requestId, so replies (which arrive async and out of order)
+// can be routed back to the right caller
+let gNextSimplifyRequestId = 1;
+const gPendingSimplifyRequests = {};
+
 window.addEventListener('message', evt => {
   if (evt.origin !== window.location.origin || !evt.data || evt.data.namespace !== kMsgNamespace) return;
   if (evt.data.direction !== 'to-agent' || !evt.data.msg) return;
@@ -94,10 +98,33 @@ window.addEventListener('message', evt => {
     resolveSettingsReady();
     gRendererLoop && gRendererLoop.setRenderDirty();
   }
+  else if (msg.simplifyResult) {
+    const { requestId, text, error } = msg.simplifyResult;
+    const pending = gPendingSimplifyRequests[requestId];
+    if (!pending) return;
+    delete gPendingSimplifyRequests[requestId];
+    if (error) pending.reject(new Error(error));
+    else pending.resolve(text);
+  }
 }, false);
 
 // connect immediately so we get the settings before playback starts (used for language mode)
 window.postMessage({ namespace: kMsgNamespace, direction: 'to-background' }, '*');
+
+// Ask the background script (which holds the API key) to simplify this text. The background
+// only honors this while the setting is on, and the agent can never read or set the API key.
+function simplifyViaBackground(text, level) {
+  return new Promise((resolve, reject) => {
+    const requestId = gNextSimplifyRequestId++;
+    gPendingSimplifyRequests[requestId] = { resolve, reject };
+    sendToBackground({ simplify: { requestId, text, level } });
+    setTimeout(() => {
+      if (!gPendingSimplifyRequests[requestId]) return;
+      delete gPendingSimplifyRequests[requestId];
+      reject(new Error('Timed out waiting for simplified text'));
+    }, 10000);
+  });
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -248,67 +275,28 @@ const lookUpWord = rawWord => {
 
 
 
-// Set to true to simplify secondary subtitles with OpenAI (needs an API key in callOpenAIForTranslation).
-// When false, secondary subtitles show Netflix's original text.
-const kSimplifySubtitlesWithOpenAI = false;
+// Cache of in-flight/settled simplify promises, keyed by `${level}\n${originalText}`, so
+// re-rendering the same cue (e.g. on resize or a settings change, which force a re-render
+// regardless of lastRenderedIds) doesn't fire a duplicate request while one is already pending.
+// Also used to ignore late replies for a cue that's no longer on screen.
+const gSimplifiedTextCache = {};
 
-// Function to translate text based on selected vocabulary size
-async function translateText(selectedVocabularySize, textContent) {
-  if (!textContent) {
-    console.log('Text content is empty. Skipping translation.');
-    return ''; // Return an empty string if textContent is empty
+// Kicks off a simplify request in the background (never awaited by the render loop -- a slow or
+// failed request must not stall requestAnimationFrame) and calls onReady with the result if/when
+// it arrives while `isStillCurrent` holds.
+function simplifySubtitleText(text, level, isStillCurrent, onReady) {
+  const cacheKey = `${level}\n${text}`;
+  if (!(cacheKey in gSimplifiedTextCache)) {
+    gSimplifiedTextCache[cacheKey] = simplifyViaBackground(text, level);
   }
-  
-  try {
-      console.log("translating text: ", textContent);
-      const prompt = constructPrompt(selectedVocabularySize, textContent);
-      const translatedText = await callOpenAIForTranslation(prompt);
-      console.log('Translated Text:', translatedText);
-      return translatedText;
-  } catch (error) {
-      console.error('Error:', error);
-      throw error; // Rethrow the error for handling in the caller function
-  }
-}
-
-// Function to construct prompt based on selected vocabulary size
-function constructPrompt(selectedVocabularySize, textContent) {
-  // Eventually allow different languages
-  let prompt = `Simplify the following text in English assuming user has only a basic vocabulary of `;
-  
-  if (selectedVocabularySize === '100') {
-      prompt += `100 words or less. Please it make it very accessible. \n\n${textContent}`;
-  } else if (selectedVocabularySize === '300') {
-      prompt += `300 words or less. Please it make it very accessible.\n\n${textContent}`;
-  } else if (selectedVocabularySize === '1k') {
-      prompt += `1000 words or less.\n\n${textContent}`;
-  } else if (selectedVocabularySize === 'fluency') {
-      prompt += `a full vocabulary for fluency.\n\n${textContent}`;
-  }
-  
-  console.log('Prompt: ', prompt)
-  return prompt;
-}
-
-async function callOpenAIForTranslation(prompt) {
-  const APIkey = "";
-  const openai = new OpenAI({ apiKey: APIkey, dangerouslyAllowBrowser: true });
-
-  try {
-    const response = await openai.chat.completions.create({
-      model: "gpt-3.5-turbo",
-      messages: [
-        {
-          role: "user",
-          content: prompt
-        }
-      ]
+  gSimplifiedTextCache[cacheKey]
+    .then(simplified => {
+      if (isStillCurrent()) onReady(simplified);
+    })
+    .catch(err => {
+      delete gSimplifiedTextCache[cacheKey]; // allow retrying a failed request later
+      console.warn('Error simplifying subtitles, showing original text:', err.message);
     });
-    console.log(response.choices[0].message.content);
-    return response.choices[0].message.content;
-  } catch (error) {
-    console.error("Error generating chat completion:", error);
-  }
 }
 
 
@@ -353,25 +341,16 @@ class TextSubtitle extends SubtitleBase {
     });
   }
 
-  async _renderText(lines, options) {
-    // .join('\n').split('\n') because speaker-based captions come as separate lines without a \n,
-    // while regular captions come as a single line containing \n
-    let text = lines.map(line => line.text).join('\n');
-    if (kSimplifySubtitlesWithOpenAI && text.trim()) {
-      const selectedVocabularySize = '100';
-      try {
-        text = (await translateText(selectedVocabularySize, text)) || text;
-      } catch (err) {
-        console.error('Error simplifying subtitles:', err);
-      }
-    }
+  // one <span> per word (clicking it, or pressing 1-9, looks it up and adds it to the word bank),
+  // laid out to hang just below the primary subtitles, which sit on the lower baseline
+  _buildTextContainer(text, options) {
     const textLines = text.split('\n')
       .map(line => line.replace(/\s+/g, ' ').trim())
       .filter(line => line);
 
     gSubtitleWords = [];
     const container = document.createElement('div');
-    if (!textLines.length) return [container];
+    if (!textLines.length) return container;
 
     // `em` as font size was not so good -- some other extensions change the em (?)
     const fontSize = Math.ceil(this.extentHeight / 30) * options.secondaryTextScale;
@@ -380,14 +359,12 @@ class TextSubtitle extends SubtitleBase {
       .map(([x, y]) => `${x * stroke}px ${y * stroke}px 0 #000`)
       .join(', ');
 
-    // hang just below the primary subtitles, which sit on the lower baseline
     container.style.cssText = `position:absolute; left:5%; right:5%;
       top:${(options.lowerBaselinePos + 0.01) * 100}%;
       text-align:center; font-family:Arial, Helvetica, sans-serif; font-size:${fontSize}px; line-height:1.25;
       color:${options.secondaryTextColor}; opacity:${options.secondaryTextOpacity};
       text-shadow:${stroke > 0 ? outline : 'none'};`;
 
-    // one <span> per word: click it (or press 1-9) to look it up and add it to the word bank
     textLines.forEach(line => {
       const lineElem = document.createElement('div');
       line.split(' ').forEach((word, i) => {
@@ -401,6 +378,28 @@ class TextSubtitle extends SubtitleBase {
       });
       container.appendChild(lineElem);
     });
+
+    return container;
+  }
+
+  // Renders the original text immediately (never blocks the render loop on a network call). If
+  // simplification is on, a background request is kicked off and -- once it resolves, assuming
+  // this cue (identified by `lastRenderedIds`) is still the one on screen -- its container's
+  // content is replaced in place with the simplified version.
+  _renderText(lines, options) {
+    // .join('\n').split('\n') because speaker-based captions come as separate lines without a \n,
+    // while regular captions come as a single line containing \n
+    const text = lines.map(line => line.text).join('\n');
+    const container = this._buildTextContainer(text, options);
+
+    if (options.simplifySubtitlesWithAI && text.trim()) {
+      const renderedForIds = this.lastRenderedIds;
+      const isStillCurrent = () => this.lastRenderedIds === renderedForIds && container.parentNode;
+      simplifySubtitleText(text, options.simplifyVocabularyLevel, isStillCurrent, simplified => {
+        const simplifiedContainer = this._buildTextContainer(simplified, options);
+        container.replaceChildren(...simplifiedContainer.childNodes);
+      });
+    }
 
     return [container];
   }
